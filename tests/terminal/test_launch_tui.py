@@ -792,6 +792,21 @@ class AccessStep(Base):
             self.assertNotIn("An API key was made", text_of(app))
         self.run_app(case)
 
+    def test_moving_back_to_this_computer_only_takes_the_key_back(self):
+        """#5812: reading the help text under the other choices made a key, and nothing took it back: the launch
+        served on localhost with a key, while that very screen says a local launch never needs one."""
+        async def case(app, pilot, ctx):
+            await press(pilot, *self.reach(), "down", "down", "up", "up")      # read every text, end on local
+            self.assertEqual(ctx.settings.access, "local")
+            self.assertIsNone(ctx.settings.api_key)                            # the key the cursor made is gone
+            self.assertIn("API key   [ off ]", text_of(app))
+            self.assertIn("not needed on this computer", text_of(app))
+            await press(pilot, "enter")
+            self.assertEqual(ctx.settings.access, "local")
+            self.assertIsNone(ctx.settings.api_key)                            # and it stays gone at commit
+            self.assertIn("Save as preset, then launch", text_of(app))
+        self.run_app(case)
+
 
 class SaveAndRun(Base):
     def reach(self):

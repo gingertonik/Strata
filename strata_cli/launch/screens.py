@@ -1575,13 +1575,32 @@ class AccessScreen(Base):
         return out
 
     def on_cursor(self) -> None:
-        kind = self.menu().current.key
+        self.apply_access(self.menu().current.key)
+
+    def apply_access(self, kind: str, announce: bool = True) -> None:
+        """The key of one access choice, shared by the cursor and by the commit (#5812).
+
+        Beyond this computer Strata makes an API key (the preset's kept key when it has one).  'This computer only'
+        never needs one, so landing on it takes back a key this screen made while the cursor was only reading the
+        help text under the other choices: left in place it went into the run config (`derive_config`) and into the
+        saved preset, and the server then refused a client that the same screen said needs no key.  Outside the TUI
+        the rule is the same one (`cmd.py`: a key is made only when the access is beyond this computer).
+        """
         s = self.ctx.settings
         s.access = kind
-        if kind != "local" and not s.api_key and not s.no_key:
+        if kind == "local":
+            if s.api_key:
+                s.api_key, s.no_key = None, False       # not "serve without a key beyond this computer": here none is needed
+                if announce:
+                    self.say("No API key: only programs on this computer can reach it.")
+            elif announce:
+                self.paint()
+            return
+        if not s.api_key and not s.no_key:
             s.api_key = acc.kept_key() or acc.new_key()
-            self.say("An API key was made for you (recommended beyond this computer). Press t if you want no key.")
-        elif kind != "local" and s.no_key:
+            if announce:
+                self.say("An API key was made for you (recommended beyond this computer). Press t if you want no key.")
+        elif s.no_key and announce:
             self.say(S.NO_KEY_PUBLIC if kind == "cloudflare" else S.NO_KEY_NETWORK, True)
 
     def action_port(self) -> None:
@@ -1625,10 +1644,7 @@ class AccessScreen(Base):
         self.app.advance()           # type: ignore[attr-defined]
 
     def commit(self) -> None:
-        s = self.ctx.settings
-        s.access = self.menu().current.key
-        if s.access != "local" and not s.api_key and not s.no_key:
-            s.api_key = acc.kept_key() or acc.new_key()
+        self.apply_access(self.menu().current.key, announce=False)     # the same rule as the cursor's (#5812)
 
     def action_back(self) -> None:
         if self.input_open():
