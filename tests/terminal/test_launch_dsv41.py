@@ -286,5 +286,109 @@ class CoderHuggingFaceLayout(unittest.TestCase):
             missing = self.mod.dsv41_shared_missing("ISTA-DAS-Coder", self.home.base / "models", given, vision=True)
             self.assertEqual([n for n, _ in missing], [self.mod.DSV41_DSPARK], given)       # only the drafter is still to fetch
 
+class PlanSharedFilesInPlace(unittest.TestCase):
+    """Strix, 2026-11-13 (issue #5676): the files the official sets share (the 110.6 GB n-gram table, the 8.0 GB DSpark drafter) go into
+    `deepseek-v4.1-flash-shared` next to the model folder, and the catalog's GB figure for a set counts them.  The plan of a model that is
+    not started yet read only the model's own folder, so with every file present it said "About 118.6 GB to download" and warned about disk
+    space for a download that would never happen.  The plan asks setup what is still missing: the same search the acquisition makes."""
+
+    MODEL = "IST-DAS-2.00bpw"
+
+    def setUp(self):
+        self.home = Home().__enter__()
+        self.addCleanup(self.home.__exit__, None, None, None)
+        self.hw = dict(HW_4X32)
+        p = mock.patch.object(Catalog, "hardware", lambda s, fresh=False: dict(self.hw))
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch("strata_control.dsv41_fit._on_windows", lambda: False)      # the fit asks the host OS; these are Linux cards
+        p.start()
+        self.addCleanup(p.stop)
+        self.mod = catalog(self.hw).strata.setup_module()
+        self.fam = self.mod.MULTI_FILE_FAMILIES["deepseek41"]
+        self.md = self.fam["models"][self.MODEL]
+        self.engram = self.mod.DSV41_ISTA_ENGRAM
+        self.assertIn(self.engram, self.md["shared"])                              # the fixture follows setup's own names
+        self.data = self.home.base / "data"
+        self.folder = self.data / "models" / (self.fam["tag"] + self.MODEL)         # setup's name for the set's folder
+        self.shared = self.data / "models" / (self.fam["tag"] + "shared")
+
+    def pin(self, name: str) -> int:
+        return int(self.fam["sha256"][name][0])
+
+    @staticmethod
+    def _file(path: Path, size: int):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("wb") as f:
+            f.truncate(size)                                                        # the pinned size, taken sparsely: no real bytes
+
+    def install(self, shards: bool = True, skip_shared: tuple = (), half: tuple | None = None):
+        """The files setup would have put here: the set's shards in its folder, the shared files in the shared folder with their finish marks."""
+        if shards:
+            for n in self.md["shards"]:
+                self._file(self.folder / n, self.pin(n))
+        for n in self.md["shared"]:
+            if n in skip_shared:
+                continue
+            self._file(self.shared / n, self.pin(n))
+            (self.shared / (n + ".done")).write_text("2026-11-13", encoding="utf-8")
+        if half:
+            name, have = half
+            (self.shared / name).unlink(missing_ok=True)
+            (self.shared / (name + ".done")).unlink(missing_ok=True)
+            self._file(self.shared / (name + ".part"), have)                    # setup stopped mid-fetch: the part file is what is on disk
+
+    def install_reader(self):
+        """The picture file setup fetches with the pictures on (its own pin, in the shared folder)."""
+        name = self.mod.DSV41_MMPROJ
+        self._file(self.shared / name, self.pin(name))
+        (self.shared / (name + ".done")).write_text("2026-11-13", encoding="utf-8")
+
+    def runner(self, vision: str = "off") -> Runner:
+        s = S.LaunchSettings(family="deepseek41", model=self.MODEL, context=8192, vision=vision, data_dir=str(self.data))
+        return Runner(s, catalog=catalog(self.hw))
+
+    def test_every_file_present_is_nothing_to_download(self):
+        self.install()
+        plan = self.runner().download_plan()
+        self.assertEqual(plan["gb"], 0, plan)
+        self.assertIn("Nothing to download: the model is already on this computer.", plan["text"])
+
+    def test_the_plan_json_agrees_and_makes_no_disk_warning(self):
+        self.install()
+        code, out, err = run_cli(["launch", "--plan", "--output", "json", "--model", "ist-das-2.00bpw",
+                                  "--no-tui", "--vision", "off", "--data-dir", str(self.data)])
+        self.assertEqual(code, 0, err + out)
+        p = json.loads(out)["plan"]
+        self.assertEqual(p["download"]["gb"], 0, p["download"])
+        self.assertNotIn("Disk space", json.dumps(p.get("placement") or {}), p.get("placement"))
+
+    def test_pictures_on_counts_the_picture_file_and_its_fetch_completes_the_set(self):
+        self.install()
+        plan = self.runner(vision="on").download_plan()
+        self.assertEqual(1.0, plan["gb"], plan)                       # the 0.97 GB picture file is the one file not fetched with --vision off
+        self.assertIn("the picture reader", " ".join(p["label"] for p in plan["parts"]), plan)
+        self.install_reader()
+        self.assertEqual(0, self.runner(vision="on").download_plan()["gb"], self.runner(vision="on").download_plan())
+
+    def test_a_half_fetched_engram_counts_only_the_rest(self):
+        self.install(skip_shared=(self.engram,), half=(self.engram, 40_000_000_000))
+        plan = self.runner().download_plan()
+        want = round((self.pin(self.engram) - 40_000_000_000) / 1e9, 1)
+        self.assertEqual(plan["gb"], want, plan)
+        self.assertIn("the n-gram table", " ".join(f"{p['label']} ({p['gb']} GB)" for p in plan["parts"]), plan)
+
+    def test_the_start_screen_says_the_files_are_here(self):
+        self.install()
+        st = self.runner().model_state()
+        self.assertEqual([], st.parts)
+        self.assertEqual(0, st.remaining_gb)
+        self.assertIn("Nothing", st.headline())
+
+    def test_nothing_on_disk_still_plans_the_whole_model(self):
+        plan = self.runner().download_plan()
+        self.assertEqual(256.8, plan["gb"], plan)           # unchanged: 138.2 GB of shards, 110.6 GB of Engram, 8.0 GB of drafter
+
+
 if __name__ == "__main__":
     unittest.main()

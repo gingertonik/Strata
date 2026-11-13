@@ -60,6 +60,10 @@ class ModelState:
         if self.installed:
             return (f"The model's files are no longer all on this computer. About {self.remaining_gb:.0f} GB would be downloaded "
                     f"({self._names()}).")
+        if not self.parts:
+            # every file is on this computer: the set's own folder and, for a model whose files are spread over more than one folder (DeepSeek: the
+            # n-gram table and the drafter sit in the shared folder beside it), the shared folder too; only the run config is missing
+            return "All of the model's files are on this computer. Nothing needs to be downloaded."
         if self.on_disk_gb >= 1:
             return (f"{self.on_disk_gb:.0f} GB of the model is already in the folder. About {self.remaining_gb:.0f} GB left to download "
                     f"(the whole model is {self.total_gb:.0f} GB).")
@@ -197,7 +201,16 @@ def assess(catalog, family: str | None, model: str | None, *, vision: str = "off
         except OSError:
             pass
         st.on_disk_gb = got / 1e9
-        st.parts.append(Part("weights", "the model", max(st.total_gb - st.on_disk_gb, 0.0)))
+        split = shared_split(catalog, family, model, base, vision not in ("off", "no"), st.total_gb, st.on_disk_gb)
+        if split is None:
+            st.parts.append(Part("weights", "the model", max(st.total_gb - st.on_disk_gb, 0.0)))
+        else:
+            # the set's own files and the shared files are counted apart, each by what is actually missing of it
+            own_left, shared_left = split
+            if own_left >= 0.05:
+                st.parts.append(Part("weights", "the model", own_left))
+            for label, gb in shared_left:
+                st.parts.append(Part("shared", label, gb))
         if family in HELPER_FAMILIES:
             # setup fetches the draft layer and the picture reader after the model, so the question and the disk check count them too
             if mtp != "off" and not (base / "mtp" / "rt" / "experts.bin").is_file():
@@ -205,6 +218,36 @@ def assess(catalog, family: str | None, model: str | None, *, vision: str = "off
             if wants_pictures and not reader_present(catalog, family, [base, *data_places(catalog, None)]):     # setup's rule: the pinned name, here or in a folder it reuses
                 st.parts.append(Part("mmproj", "the picture reader", MMPROJ_GB))
     return st
+
+
+def shared_split(catalog, family: str | None, model: str | None, base: Path, pictures: bool,
+                 total_gb: float, on_disk_gb: float) -> tuple | None:
+    """(the GB of the set's own files still to fetch, [(the label, the GB)] of the shared files still to fetch) for a model whose files are
+    spread over more than one folder (DeepSeek-V4.1: the set's shards in the set's folder, and the files the official sets share — the
+    110.6 GB n-gram table, the 8.0 GB DSpark drafter, the picture file — in one folder beside them, so a second set does not fetch them
+    again).  The catalog's figure for a set counts both groups, so a plan that reads only the set's own folder charges the person for the
+    n-gram table they already have (issue #5676, `--plan` with every file present: "About 118.6 GB to download" and a disk-space warning).
+    setup is asked with the search its acquisition makes (dsv41_shared_missing), so the plan and the download cannot disagree.  None: not a
+    multi-folder model, a set whose shared files setup does not pin, or setup cannot be asked: the caller keeps the figure it has."""
+    try:
+        mod = catalog.strata.setup_module()
+        fam = (getattr(mod, "MULTI_FILE_FAMILIES", None) or {}).get(family or "") or {}
+        md = (fam.get("models") or {}).get(model or "") or {}
+        sha = fam.get("sha256") or {}
+        names = list(md.get("shared", []))
+        pins = {n: int(sha[n][0]) for n in names if n in sha}
+        if not names or len(pins) != len(names):
+            return None
+        reader = getattr(mod, "DSV41_MMPROJ", None)
+        if pictures and reader in sha:
+            pins[reader] = int(sha[reader][0])
+        still = mod.dsv41_shared_missing(model, Path(base) / "models", None, vision=pictures)
+    except Exception:                                        # noqa: BLE001 - a question asked early is never a reason to stop
+        return None
+    labels = {getattr(mod, "DSV41_DSPARK", ""): "the DSpark drafter", getattr(mod, "DSV41_ISTA_ENGRAM", ""): "the n-gram table",
+              (reader or ""): "the picture reader"}
+    left = [(labels.get(n, "a shared file"), sz / 1e9) for n, sz in still if sz >= 5e7]      # the plan names what is worth fetching
+    return max(max(total_gb - sum(pins.values()) / 1e9, 0.0) - on_disk_gb, 0.0), left        # the set's own group, minus what its folder holds
 
 
 def data_places(catalog, data: Path | None) -> list[Path]:
